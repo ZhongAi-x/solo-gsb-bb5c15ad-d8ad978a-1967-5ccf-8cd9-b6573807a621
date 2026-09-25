@@ -4,7 +4,7 @@ const path = require('path');
 const express = require('express');
 const multer = require('multer');
 const { imposePdf, parseMaxSheetsPerSignature, parsePaperThicknessMm } = require('./lib/impose');
-const { reprintPdf, ReprintInputError } = require('./lib/reprint');
+const { reprintPdf, ReprintInputError, buildReprintMultipart } = require('./lib/reprint');
 const { preflightPdf } = require('./lib/preflight');
 const {
   preflightPdfBatch,
@@ -253,7 +253,9 @@ app.post('/api/impose', uploadGate, upload.single('pdf'), async (req, res) => {
 
 // 缺页补印接口：上传原 PDF + 受损页码表达式（字段 pages，如 "2,5-7"），
 // 按与 /api/impose 相同的拼版选项复用拼版方案，定位受损页所在印张后
-// 成对抽取正背面生成补印 PDF；补印明细通过响应头 X-Reprint-Plan 回传。
+// 成对抽取正背面生成补印 PDF；补印方案 JSON 与补印 PDF 作为同一响应体
+// 中的两个部分（multipart/related）返回——明细随受损页数增长，不再放入
+// 自定义响应头（约 400 页全选时会超过常见客户端的响应头解析上限）。
 // 空输入、格式错误、越界页码等输入问题返回 400；损坏/加密 PDF 返回 422。
 app.post('/api/reprint', uploadGate, upload.single('pdf'), async (req, res) => {
   try {
@@ -278,12 +280,12 @@ app.post('/api/reprint', uploadGate, upload.single('pdf'), async (req, res) => {
       req.body ? req.body.pages : undefined,
     );
 
-    // 补印明细为纯 ASCII JSON，放入自定义响应头供前端渲染命中列表
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', 'attachment; filename="booklet-reprint.pdf"');
-    res.setHeader('X-Reprint-Plan', encodeURIComponent(JSON.stringify(reprint)));
-    res.setHeader('Access-Control-Expose-Headers', 'X-Reprint-Plan');
-    return res.end(Buffer.from(pdfBytes));
+    // 方案 JSON（第一部分）+ 补印 PDF（第二部分）打包为 multipart/related，
+    // 响应头只携带边界等固定大小信息，与受损页数无关
+    const { contentType, body } = buildReprintMultipart(reprint, pdfBytes);
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Length', body.length);
+    return res.end(body);
   } catch (err) {
     if (err && err.code === 'LIMIT_FILE_SIZE') {
       return res.status(413).json({ error: `文件超过大小限制（${MAX_FILE_SIZE / 1024 / 1024}MB）` });

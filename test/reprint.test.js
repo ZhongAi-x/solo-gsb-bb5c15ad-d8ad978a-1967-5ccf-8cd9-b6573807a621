@@ -13,6 +13,7 @@ const {
   parseReprintPages,
   buildReprintPlan,
   reprintPdf,
+  buildReprintMultipart,
 } = require('../lib/reprint');
 const { buildImpositionPlan, buildSignaturePlan, imposePdf } = require('../lib/impose');
 const { MARK_MARGIN_PT } = require('../lib/sheet-marks');
@@ -308,6 +309,48 @@ function decodePageContent(doc, pageIndex) {
     /不是有效的 PDF/,
   );
   console.log('✅ 补印无界展开防护通过：2^53 区间与超大区间在拼版前拒绝，损坏 PDF 报错规则不变');
+
+  // ---------- 4. multipart/related 响应体打包 ----------
+  // 补印明细随受损页数增长，不再放入响应头：方案 JSON 与补印 PDF 作为同一
+  // 响应体中的两个部分交付，边界不出现在任一部分内容中，PDF 字节原样保留
+  const { contentType, body: multipartBodyBuf } = buildReprintMultipart(reprint, reprintBytes);
+  assert.ok(contentType.startsWith('multipart/related'), 'Content-Type 为 multipart/related');
+  const boundary = /boundary="([^"]+)"/.exec(contentType)[1];
+  assert.ok(boundary, 'Content-Type 含 boundary 参数');
+  // 边界不出现在任一部分内容中（按边界切分不会误切）
+  assert.ok(!Buffer.from(JSON.stringify(reprint)).includes(boundary), '边界不出现在方案 JSON 中');
+  assert.ok(!Buffer.from(reprintBytes).includes(boundary), '边界不出现在补印 PDF 中');
+
+  // 按边界解析回两个部分：JSON 与 PDF 字节完全一致
+  const delimiter = `\r\n--${boundary}`;
+  assert.strictEqual(multipartBodyBuf.indexOf(`--${boundary}`), 0, '响应体以起始边界开头');
+  const rawParts = [];
+  let cursor = `--${boundary}`.length;
+  while (!(multipartBodyBuf[cursor] === 0x2d && multipartBodyBuf[cursor + 1] === 0x2d)) {
+    const start = cursor + 2; // 跳过边界后的 \r\n
+    const end = multipartBodyBuf.indexOf(delimiter, start);
+    assert.ok(end !== -1, '每个部分之后应有下一个边界');
+    rawParts.push(multipartBodyBuf.subarray(start, end));
+    cursor = end + delimiter.length;
+  }
+  assert.strictEqual(rawParts.length, 2, '响应体为方案 JSON + 补印 PDF 两部分');
+  const parsedParts = rawParts.map((part) => {
+    const sep = part.indexOf('\r\n\r\n');
+    assert.ok(sep !== -1, '部分含头部结束');
+    return {
+      head: part.subarray(0, sep).toString('latin1'),
+      body: part.subarray(sep + 4),
+    };
+  });
+  assert.match(parsedParts[0].head, /Content-Type: application\/json/, '第一部分为 JSON');
+  assert.match(parsedParts[1].head, /Content-Type: application\/pdf/, '第二部分为 PDF');
+  assert.deepStrictEqual(JSON.parse(parsedParts[0].body.toString('utf8')), reprint,
+    '方案 JSON 原样往返');
+  assert.deepStrictEqual(parsedParts[1].body, Buffer.from(reprintBytes),
+    'PDF 字节原样保留，未被文本编码破坏');
+  // 打包后的 PDF 部分可直接加载
+  assert.strictEqual((await PDFDocument.load(parsedParts[1].body)).getPageCount(), 4);
+  console.log('✅ multipart 打包通过：方案 JSON 与补印 PDF 为同一响应体的两个部分，边界不撞内容、字节无损');
 })().catch((err) => {
   console.error(err);
   process.exit(1);

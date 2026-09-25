@@ -356,6 +356,28 @@ async function makePdf(pages) {
     });
   }
 
+  // 解析补印接口的 multipart/related 响应体（第一部分 JSON 方案 + 第二部分 PDF）
+  function parseReprintParts(resp) {
+    const m = /boundary="?([^";]+)"?/i.exec(resp.headers['content-type'] || '');
+    assert.ok(m, '补印响应 Content-Type 应含 boundary 参数');
+    const delimiter = `\r\n--${m[1]}`;
+    const parts = [];
+    let cursor = `--${m[1]}`.length;
+    assert.strictEqual(resp.body.indexOf(`--${m[1]}`), 0, '响应体应以起始边界开头');
+    while (!(resp.body[cursor] === 0x2d && resp.body[cursor + 1] === 0x2d)) {
+      const start = cursor + 2; // 跳过边界后的 \r\n
+      const end = resp.body.indexOf(delimiter, start);
+      assert.ok(end !== -1, '每个部分之后应有下一个边界');
+      parts.push(resp.body.subarray(start, end));
+      cursor = end + delimiter.length;
+    }
+    return parts.map((part) => {
+      const sep = part.indexOf('\r\n\r\n');
+      assert.ok(sep !== -1, '部分应含头部结束');
+      return part.subarray(sep + 4);
+    });
+  }
+
   try {
     // 8.1 拼版接口透传爬移选项
     const ok = await post('/api/impose', multipart(
@@ -388,16 +410,20 @@ async function makePdf(pages) {
       assert.match(JSON.parse(bad.body.toString()).error, /纸厚必须是 0\.05～0\.5 mm/);
     }
 
-    // 8.4 补印接口透传爬移选项并逐张回传补偿量
+    // 8.4 补印接口透传爬移选项并逐张回传补偿量（方案 JSON 在响应体第一部分中）
     const rp = await post('/api/reprint', multipart(
       { pages: '2,5-7', creepCompensation: 'on', paperThicknessMm: '0.1' },
       Buffer.from(tenBytes),
     ));
     assert.strictEqual(rp.status, 200);
-    const rpPlan = JSON.parse(decodeURIComponent(rp.headers['x-reprint-plan']));
+    assert.ok(rp.headers['content-type'].includes('multipart/related'));
+    assert.strictEqual(rp.headers['x-reprint-plan'], undefined, '补印明细不再放入响应头');
+    const rpParts = parseReprintParts(rp);
+    assert.strictEqual(rpParts.length, 2, '响应体应为方案 JSON + 补印 PDF 两部分');
+    const rpPlan = JSON.parse(rpParts[0].toString('utf8'));
     assert.deepStrictEqual(rpPlan.creep, { enabled: true, paperThicknessMm: 0.1 });
     assert.deepStrictEqual(rpPlan.sheets.map((s) => s.creepShiftMm), [0, 0.2]);
-    assert.strictEqual((await PDFDocument.load(rp.body)).getPageCount(), 4);
+    assert.strictEqual((await PDFDocument.load(rpParts[1])).getPageCount(), 4);
 
     // 补印接口非法纸厚同样 400
     const rpBad = await post('/api/reprint', multipart(
