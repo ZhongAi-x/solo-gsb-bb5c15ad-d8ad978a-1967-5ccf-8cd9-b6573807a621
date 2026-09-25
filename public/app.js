@@ -2023,6 +2023,60 @@ cuttingDownloadBtn.addEventListener('click', () => {
 
 // ---------- 缺页补印 ----------
 
+/**
+ * 解析补印响应体：服务端把补印方案 JSON（plan 部分）与补印 PDF（pdf 部分）
+ * 打包为单个 multipart/form-data 响应（受损页较多时明细体积会超过常见
+ * 客户端响应头解析上限，故不再走响应头）。这里按字节扫描边界拆分两部分——
+ * PDF 始终保持原始字节，不经过任何文本编解码，避免二进制内容被破坏；
+ * 仅 plan 部分按 UTF-8 文本解码。
+ * @param {ArrayBuffer} buffer 完整响应体
+ * @param {string} contentType 响应 Content-Type（含 boundary 参数）
+ * @returns {{ plan: string, pdf: Uint8Array }} 方案 JSON 文本与 PDF 原始字节
+ */
+function parseReprintResponse(buffer, contentType) {
+  const match = /boundary="?([^\s";]+)"?/i.exec(contentType || '');
+  if (!match) throw new Error('补印响应缺少分段边界');
+  const bytes = new Uint8Array(buffer);
+  const boundary = new TextEncoder().encode(`--${match[1]}`);
+
+  // 在字节序列中从 from 起查找边界位置（找不到返回 -1）
+  const findBoundary = (from) => {
+    for (let i = Math.max(0, from); i + boundary.length <= bytes.length; i += 1) {
+      let hit = true;
+      for (let j = 0; j < boundary.length; j += 1) {
+        if (bytes[i + j] !== boundary[j]) { hit = false; break; }
+      }
+      if (hit) return i;
+    }
+    return -1;
+  };
+  const isCrlf = (i) => bytes[i] === 13 && bytes[i + 1] === 10;
+
+  const parts = {};
+  let pos = findBoundary(0);
+  while (pos >= 0) {
+    const headStart = pos + boundary.length;
+    if (bytes[headStart] === 45 && bytes[headStart + 1] === 45) break; // 结束边界 "--"
+    if (!isCrlf(headStart)) throw new Error('补印响应分段格式不正确');
+    // 分段头以空行（连续两个 CRLF）结束
+    let headEnd = -1;
+    for (let i = headStart + 2; i + 3 < bytes.length; i += 1) {
+      if (isCrlf(i) && isCrlf(i + 2)) { headEnd = i; break; }
+    }
+    if (headEnd < 0) throw new Error('补印响应分段格式不正确');
+    const headText = new TextDecoder('utf-8').decode(bytes.subarray(headStart + 2, headEnd));
+    const name = (/name="([^"]+)"/.exec(headText) || [])[1];
+    const contentStart = headEnd + 4;
+    const next = findBoundary(contentStart);
+    // 边界前的 CRLF 属于分隔符，不属于内容
+    if (next < 2 || !isCrlf(next - 2)) throw new Error('补印响应分段格式不正确');
+    if (name) parts[name] = bytes.subarray(contentStart, next - 2);
+    pos = next;
+  }
+  if (!parts.plan || !parts.pdf) throw new Error('补印响应缺少方案或 PDF 部分');
+  return { plan: new TextDecoder('utf-8').decode(parts.plan), pdf: parts.pdf };
+}
+
 function setReprintStatus(text, kind) {
   reprintStatusEl.textContent = text || '';
   reprintStatusEl.className = kind ? `status ${kind}` : 'status';
@@ -2153,14 +2207,15 @@ reprintBtn.addEventListener('click', async () => {
       throw new Error(message);
     }
 
-    const planHeader = resp.headers.get('X-Reprint-Plan');
-    if (!planHeader) throw new Error('响应缺少补印方案');
-    const data = JSON.parse(decodeURIComponent(planHeader));
+    // 补印方案 JSON 与 PDF 在同一响应体的两个分段中，不再从响应头读取明细；
+    // PDF 分段按原始字节取出，不经文本编码
+    const buffer = await resp.arrayBuffer();
+    const { plan, pdf } = parseReprintResponse(buffer, resp.headers.get('Content-Type'));
+    const data = JSON.parse(plan);
 
-    const blob = await resp.blob();
     if (!isCurrent()) return; // 已换稿或重新拼版：丢弃旧补印结果
     reprintData = data;
-    reprintBlobUrl = URL.createObjectURL(blob);
+    reprintBlobUrl = URL.createObjectURL(new Blob([pdf], { type: 'application/pdf' }));
 
     renderReprintResult(reprintData);
     reprintDownloadBtn.disabled = false;

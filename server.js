@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('crypto');
 const path = require('path');
 const express = require('express');
 const multer = require('multer');
@@ -253,8 +254,49 @@ app.post('/api/impose', uploadGate, upload.single('pdf'), async (req, res) => {
 
 // 缺页补印接口：上传原 PDF + 受损页码表达式（字段 pages，如 "2,5-7"），
 // 按与 /api/impose 相同的拼版选项复用拼版方案，定位受损页所在印张后
-// 成对抽取正背面生成补印 PDF；补印明细通过响应头 X-Reprint-Plan 回传。
+// 成对抽取正背面生成补印 PDF；补印方案 JSON 与补印 PDF 作为同一响应体的
+// 两个分段（multipart/form-data）返回，不再使用随受损页数增长的响应头。
 // 空输入、格式错误、越界页码等输入问题返回 400；损坏/加密 PDF 返回 422。
+
+/**
+ * 把补印方案 JSON 与补印 PDF 打包为单个 multipart/form-data 响应体：
+ * 两个可区分部分——plan（JSON 文本）与 pdf（原始二进制字节），均随响应体
+ * 传输。此前明细放在自定义响应头 X-Reprint-Plan 中，受损页较多（约 400 页
+ * 全选）时头部体积超过常见客户端/代理的响应头解析上限，合法请求会丢失
+ * 补印 PDF；改入响应体后不再受该限制，PDF 也始终以原始字节传输。
+ * 分段边界随机生成，并校验其字节序列不出现在任一部分内容中（PDF 为二进制，
+ * 理论上可能撞上边界），撞界时换边界重试。
+ *
+ * @param {object} plan 补印方案（reprintPdf 返回的 reprint 对象）
+ * @param {Uint8Array} pdfBytes 补印 PDF 字节
+ * @returns {{ contentType: string, body: Buffer }}
+ */
+function buildReprintResponseBody(plan, pdfBytes) {
+  const planJson = JSON.stringify(plan);
+  const pdfBuffer = Buffer.from(pdfBytes);
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const boundary = `----booklet-reprint-${crypto.randomBytes(18).toString('hex')}`;
+    if (planJson.includes(boundary) || pdfBuffer.includes(boundary)) continue;
+    const body = Buffer.concat([
+      Buffer.from(
+        `--${boundary}\r\n`
+        + 'Content-Disposition: form-data; name="plan"\r\n'
+        + 'Content-Type: application/json; charset=utf-8\r\n\r\n'
+        + `${planJson}\r\n`
+        + `--${boundary}\r\n`
+        + 'Content-Disposition: form-data; name="pdf"; filename="booklet-reprint.pdf"\r\n'
+        + 'Content-Type: application/pdf\r\n\r\n',
+        'utf8',
+      ),
+      pdfBuffer,
+      Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8'),
+    ]);
+    return { contentType: `multipart/form-data; boundary=${boundary}`, body };
+  }
+  // 随机边界连续撞界几乎不可能；兜底抛错按 500 处理，绝不发出被截断的响应
+  throw new Error('无法生成安全的补印响应分段边界');
+}
+
 app.post('/api/reprint', uploadGate, upload.single('pdf'), async (req, res) => {
   try {
     if (!req.file) {
@@ -278,12 +320,12 @@ app.post('/api/reprint', uploadGate, upload.single('pdf'), async (req, res) => {
       req.body ? req.body.pages : undefined,
     );
 
-    // 补印明细为纯 ASCII JSON，放入自定义响应头供前端渲染命中列表
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', 'attachment; filename="booklet-reprint.pdf"');
-    res.setHeader('X-Reprint-Plan', encodeURIComponent(JSON.stringify(reprint)));
-    res.setHeader('Access-Control-Expose-Headers', 'X-Reprint-Plan');
-    return res.end(Buffer.from(pdfBytes));
+    // 补印方案 JSON 与 PDF 作为同一响应体的两个分段返回：明细体积不再受
+    // 响应头大小限制，PDF 保持原始二进制（不经任何文本编码）
+    const { contentType, body } = buildReprintResponseBody(reprint, pdfBytes);
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Length', body.length);
+    return res.end(body);
   } catch (err) {
     if (err && err.code === 'LIMIT_FILE_SIZE') {
       return res.status(413).json({ error: `文件超过大小限制（${MAX_FILE_SIZE / 1024 / 1024}MB）` });

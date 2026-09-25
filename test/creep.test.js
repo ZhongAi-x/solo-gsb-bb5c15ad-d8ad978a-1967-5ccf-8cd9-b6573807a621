@@ -25,6 +25,7 @@ const {
 } = require('../lib/impose');
 const { reprintPdf } = require('../lib/reprint');
 const { app } = require('../server');
+const { parseReprintResponse } = require('./multipart-response');
 
 const PT_PER_MM = 72 / 25.4;
 
@@ -388,16 +389,16 @@ async function makePdf(pages) {
       assert.match(JSON.parse(bad.body.toString()).error, /纸厚必须是 0\.05～0\.5 mm/);
     }
 
-    // 8.4 补印接口透传爬移选项并逐张回传补偿量
+    // 8.4 补印接口透传爬移选项并逐张回传补偿量（方案随响应体分段返回）
     const rp = await post('/api/reprint', multipart(
       { pages: '2,5-7', creepCompensation: 'on', paperThicknessMm: '0.1' },
       Buffer.from(tenBytes),
     ));
     assert.strictEqual(rp.status, 200);
-    const rpPlan = JSON.parse(decodeURIComponent(rp.headers['x-reprint-plan']));
+    const { plan: rpPlan, pdf: rpPdf } = parseReprintResponse(rp);
     assert.deepStrictEqual(rpPlan.creep, { enabled: true, paperThicknessMm: 0.1 });
     assert.deepStrictEqual(rpPlan.sheets.map((s) => s.creepShiftMm), [0, 0.2]);
-    assert.strictEqual((await PDFDocument.load(rp.body)).getPageCount(), 4);
+    assert.strictEqual((await PDFDocument.load(rpPdf)).getPageCount(), 4);
 
     // 补印接口非法纸厚同样 400
     const rpBad = await post('/api/reprint', multipart(
